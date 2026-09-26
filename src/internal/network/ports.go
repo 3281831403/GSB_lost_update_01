@@ -2,7 +2,9 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/portsecurity"
@@ -10,6 +12,15 @@ import (
 	"github.com/gophercloud/gophercloud/v2/pagination"
 	"github.com/larkly/lazystack/internal/shared"
 )
+
+// fixedIPUpdateMaxAttempts bounds how many times a fixed IP update is retried
+// when a concurrent writer wins the revision race.
+const fixedIPUpdateMaxAttempts = 5
+
+// ErrFixedIPConflict is returned when a fixed IP update keeps losing the
+// revision race against concurrent writers. The update is aborted and
+// reported instead of silently overwriting the other writer's changes.
+var ErrFixedIPConflict = errors.New("fixed IP update conflict")
 
 // Port is a simplified representation of a Neutron port.
 type Port struct {
@@ -158,25 +169,49 @@ func FindRouterPortOnNetwork(ctx context.Context, client *gophercloud.ServiceCli
 	return result, nil
 }
 
-// AddFixedIPToPort adds a fixed IP to an existing port.
-func AddFixedIPToPort(ctx context.Context, client *gophercloud.ServiceClient, portID string, existing []FixedIP, subnetID, ipAddress string) error {
-	shared.Debugf("[network] adding fixed IP to port %s (subnet: %s, ip: %s)", portID, subnetID, ipAddress)
-	fixedIPs := make([]ports.IP, 0, len(existing)+1)
-	for _, ip := range existing {
-		fixedIPs = append(fixedIPs, ports.IP{
-			SubnetID:  ip.SubnetID,
-			IPAddress: ip.IPAddress,
-		})
+// updatePortFixedIPs applies mutate to the port's current fixed IP list using
+// optimistic concurrency: every attempt re-reads the port and sends the
+// update with an If-Match revision precondition, so a concurrent modification
+// is detected (HTTP 412) and retried instead of silently overwriting it.
+// Servers without the standard-attr-revisions extension ignore If-Match, in
+// which case the first attempt succeeds exactly as before.
+func updatePortFixedIPs(ctx context.Context, client *gophercloud.ServiceClient, portID string, mutate func(existing []ports.IP) []ports.IP) error {
+	var lastErr error
+	for attempt := 0; attempt < fixedIPUpdateMaxAttempts; attempt++ {
+		p, err := ports.Get(ctx, client, portID).Extract()
+		if err != nil {
+			return fmt.Errorf("getting port %s: %w", portID, err)
+		}
+		revision := p.RevisionNumber
+		_, err = ports.Update(ctx, client, portID, ports.UpdateOpts{
+			FixedIPs:       mutate(p.FixedIPs),
+			RevisionNumber: &revision,
+		}).Extract()
+		if err == nil {
+			return nil
+		}
+		if !gophercloud.ResponseCodeIs(err, http.StatusPreconditionFailed) {
+			return err
+		}
+		shared.Debugf("[network] fixed IP update on port %s lost revision race (attempt %d), retrying", portID, attempt+1)
+		lastErr = err
 	}
-	newIP := ports.IP{SubnetID: subnetID}
-	if ipAddress != "" {
-		newIP.IPAddress = ipAddress
-	}
-	fixedIPs = append(fixedIPs, newIP)
+	return fmt.Errorf("%w: port %s still changing after %d attempts: %v", ErrFixedIPConflict, portID, fixedIPUpdateMaxAttempts, lastErr)
+}
 
-	_, err := ports.Update(ctx, client, portID, ports.UpdateOpts{
-		FixedIPs: fixedIPs,
-	}).Extract()
+// AddFixedIPToPort adds a fixed IP to an existing port, keeping all other
+// fixed IPs intact even when the port is modified concurrently.
+func AddFixedIPToPort(ctx context.Context, client *gophercloud.ServiceClient, portID, subnetID, ipAddress string) error {
+	shared.Debugf("[network] adding fixed IP to port %s (subnet: %s, ip: %s)", portID, subnetID, ipAddress)
+	err := updatePortFixedIPs(ctx, client, portID, func(existing []ports.IP) []ports.IP {
+		fixedIPs := make([]ports.IP, 0, len(existing)+1)
+		fixedIPs = append(fixedIPs, existing...)
+		newIP := ports.IP{SubnetID: subnetID}
+		if ipAddress != "" {
+			newIP.IPAddress = ipAddress
+		}
+		return append(fixedIPs, newIP)
+	})
 	if err != nil {
 		shared.Debugf("[network] add fixed IP to port %s: %v", portID, err)
 		return fmt.Errorf("adding fixed IP to port %s: %w", portID, err)
@@ -186,28 +221,19 @@ func AddFixedIPToPort(ctx context.Context, client *gophercloud.ServiceClient, po
 }
 
 // RemoveFixedIPFromPort removes a single fixed IP (by subnet ID) from a port,
-// keeping all other fixed IPs intact.
+// keeping all other fixed IPs intact even when the port is modified
+// concurrently.
 func RemoveFixedIPFromPort(ctx context.Context, client *gophercloud.ServiceClient, portID, subnetID string) error {
 	shared.Debugf("[network] removing fixed IP from port %s (subnet: %s)", portID, subnetID)
-	p, err := ports.Get(ctx, client, portID).Extract()
-	if err != nil {
-		shared.Debugf("[network] remove fixed IP from port %s: get port: %v", portID, err)
-		return fmt.Errorf("getting port %s: %w", portID, err)
-	}
-
-	var remaining []ports.IP
-	for _, ip := range p.FixedIPs {
-		if ip.SubnetID != subnetID {
-			remaining = append(remaining, ports.IP{
-				SubnetID:  ip.SubnetID,
-				IPAddress: ip.IPAddress,
-			})
+	err := updatePortFixedIPs(ctx, client, portID, func(existing []ports.IP) []ports.IP {
+		var remaining []ports.IP
+		for _, ip := range existing {
+			if ip.SubnetID != subnetID {
+				remaining = append(remaining, ip)
+			}
 		}
-	}
-
-	_, err = ports.Update(ctx, client, portID, ports.UpdateOpts{
-		FixedIPs: remaining,
-	}).Extract()
+		return remaining
+	})
 	if err != nil {
 		shared.Debugf("[network] remove fixed IP from port %s: %v", portID, err)
 		return fmt.Errorf("removing fixed IP from port %s: %w", portID, err)
