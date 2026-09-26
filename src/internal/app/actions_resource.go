@@ -1,0 +1,969 @@
+package app
+
+import (
+	"fmt"
+	"time"
+
+	"charm.land/bubbletea/v2"
+	"github.com/larkly/lazystack/internal/loadbalancer"
+	"github.com/larkly/lazystack/internal/network"
+	"github.com/larkly/lazystack/internal/shared"
+	"github.com/larkly/lazystack/internal/ui/keypaircreate"
+	"github.com/larkly/lazystack/internal/ui/keypairdetail"
+	"github.com/larkly/lazystack/internal/ui/lbcreate"
+	"github.com/larkly/lazystack/internal/ui/lblistenercreate"
+	"github.com/larkly/lazystack/internal/ui/lbmembercreate"
+	"github.com/larkly/lazystack/internal/ui/lbmonitorcreate"
+	"github.com/larkly/lazystack/internal/ui/lbpoolcreate"
+	"github.com/larkly/lazystack/internal/ui/modal"
+	"github.com/larkly/lazystack/internal/ui/networkcreate"
+	"github.com/larkly/lazystack/internal/ui/portcreate"
+	"github.com/larkly/lazystack/internal/ui/portedit"
+	"github.com/larkly/lazystack/internal/ui/routercreate"
+	"github.com/larkly/lazystack/internal/ui/serverpicker"
+	"github.com/larkly/lazystack/internal/ui/sgcreate"
+	"github.com/larkly/lazystack/internal/ui/sgrulecreate"
+	"github.com/larkly/lazystack/internal/ui/subnetcreate"
+	"github.com/larkly/lazystack/internal/ui/subnetedit"
+	"github.com/larkly/lazystack/internal/ui/subnetpicker"
+	"github.com/larkly/lazystack/internal/ui/volumecreate"
+	"github.com/larkly/lazystack/internal/ui/volumedetail"
+	"github.com/larkly/lazystack/internal/ui/volumepicker"
+)
+
+func (m Model) openVolumeCreate() (Model, tea.Cmd) {
+	m.volumeCreate = volumecreate.New(m.client.BlockStorage)
+	m.volumeCreate.SetSize(m.width, m.height)
+	m.view = viewVolumeCreate
+	m.statusBar.CurrentView = "volumecreate"
+	m.statusBar.Hint = m.volumeCreate.Hints()
+	return m, m.volumeCreate.Init()
+}
+
+func (m Model) openVolumeDetail() (Model, tea.Cmd) {
+	v := m.volumeList.SelectedVolume()
+	if v == nil {
+		return m, nil
+	}
+	m.volumeDetail = volumedetail.New(m.client.BlockStorage, m.client.Compute, v.ID)
+	m.volumeDetail.SetSize(m.width, m.height)
+	m.view = viewVolumeDetail
+	m.statusBar.CurrentView = "volumedetail"
+	m.statusBar.Hint = m.volumeDetail.Hints()
+	return m, m.volumeDetail.Init()
+}
+
+func (m Model) openVolumeDeleteConfirm() (Model, tea.Cmd) {
+	var id, name string
+	switch m.view {
+	case viewVolumeList:
+		if v := m.volumeList.SelectedVolume(); v != nil {
+			id, name = v.ID, v.Name
+			if name == "" {
+				name = id
+			}
+		}
+	case viewVolumeDetail:
+		id = m.volumeDetail.SelectedVolumeID()
+		name = m.volumeDetail.SelectedVolumeName()
+	}
+	if id == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_volume", id, name)
+	m.confirm.Title = "Delete Volume"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete volume %q?", name)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openVolumesDeleteConfirm() (Model, tea.Cmd) {
+	vols := m.volumeList.SelectedVolumes()
+	if len(vols) == 0 {
+		return m, nil
+	}
+	refs := make([]modal.ServerRef, len(vols))
+	for i, v := range vols {
+		name := v.Name
+		if name == "" {
+			name = v.ID
+		}
+		refs[i] = modal.ServerRef{ID: v.ID, Name: name}
+	}
+	m.volumeList.ClearSelection()
+	m.confirm = modal.NewBulkConfirm("delete_volumes_bulk", refs)
+	m.confirm.Title = "Delete Volumes"
+	m.confirm.Body = fmt.Sprintf("Delete %d selected volumes?", len(refs))
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openVolumesDetachConfirm() (Model, tea.Cmd) {
+	vols := m.volumeList.SelectedVolumes()
+	if len(vols) == 0 {
+		return m, nil
+	}
+	var refs []modal.ServerRef
+	for _, v := range vols {
+		if v.AttachedServerID != "" || len(v.Attachments) > 0 {
+			name := v.Name
+			if name == "" {
+				name = v.ID
+			}
+			refs = append(refs, modal.ServerRef{ID: v.ID, Name: name})
+		}
+	}
+	if len(refs) == 0 {
+		m.statusBar.StickyHint = "None of the selected volumes are attached"
+		return m, nil
+	}
+	m.volumeList.ClearSelection()
+	m.confirm = modal.NewBulkConfirm("detach_volumes_bulk", refs)
+	m.confirm.Title = "Detach Volumes"
+	m.confirm.Body = fmt.Sprintf("Detach %d selected volumes?", len(refs))
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// blockStorageAvailable reports whether the connected cloud exposes a
+// Cinder (block storage) endpoint. Volume attach/detach/create/delete flows
+// depend on this client being non-nil; callers must gate on this before
+// invoking any volume action.
+func (m Model) blockStorageAvailable() bool {
+	return m.client.BlockStorage != nil
+}
+
+func (m Model) openVolumeAttach() (Model, tea.Cmd) {
+	if !m.blockStorageAvailable() {
+		return m, nil
+	}
+	var id, name string
+	switch m.view {
+	case viewVolumeDetail:
+		id = m.volumeDetail.SelectedVolumeID()
+		name = m.volumeDetail.SelectedVolumeName()
+	case viewVolumeList:
+		if v := m.volumeList.SelectedVolume(); v != nil {
+			id, name = v.ID, v.Name
+			if name == "" {
+				name = id
+			}
+		}
+	}
+	if id == "" {
+		return m, nil
+	}
+	m.serverPicker = serverpicker.New(m.client.Compute, id, name)
+	m.serverPicker.SetSize(m.width, m.height)
+	return m, m.serverPicker.Init()
+}
+
+func (m Model) openVolumeDetach() (Model, tea.Cmd) {
+	if !m.blockStorageAvailable() {
+		return m, nil
+	}
+	var id, name string
+	switch m.view {
+	case viewVolumeDetail:
+		id = m.volumeDetail.SelectedVolumeID()
+		name = m.volumeDetail.SelectedVolumeName()
+	case viewVolumeList:
+		if v := m.volumeList.SelectedVolume(); v != nil {
+			if v.AttachedServerID == "" {
+				return m, nil
+			}
+			id, name = v.ID, v.Name
+			if name == "" {
+				name = id
+			}
+		}
+	}
+	if id == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("detach_volume", id, name)
+	m.confirm.Title = "Detach Volume"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to detach volume %q?", name)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openServerVolumeAttach() (Model, tea.Cmd) {
+	if !m.blockStorageAvailable() {
+		return m, nil
+	}
+	var serverID, serverName string
+	switch m.view {
+	case viewServerDetail:
+		serverID = m.serverDetail.ServerID()
+		serverName = m.serverDetail.ServerName()
+	case viewServerList:
+		if s := m.serverList.SelectedServer(); s != nil {
+			serverID = s.ID
+			serverName = s.Name
+		}
+	default:
+		return m, nil
+	}
+	if serverID == "" {
+		return m, nil
+	}
+	m.volumePicker = volumepicker.New(m.client.Compute, m.client.BlockStorage, serverID, serverName)
+	m.volumePicker.SetSize(m.width, m.height)
+	return m, m.volumePicker.Init()
+}
+
+func (m Model) openServerVolumeDetach() (Model, tea.Cmd) {
+	if !m.blockStorageAvailable() {
+		return m, nil
+	}
+	if m.view != viewServerDetail {
+		return m, nil
+	}
+	volID := m.serverDetail.SelectedVolumeID()
+	volName := m.serverDetail.SelectedVolumeName()
+	if volID == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("detach_volume", volID, volName)
+	m.confirm.Title = "Detach Volume"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to detach volume %q from server %q?", volName, m.serverDetail.ServerName())
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Floating IP actions ---
+
+func (m Model) openFIPReleaseConfirm() (Model, tea.Cmd) {
+	fip := m.floatingIPList.SelectedFIP()
+	if fip == nil {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("release_fip", fip.ID, fip.FloatingIP)
+	m.confirm.Title = "Release Floating IP"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to release floating IP %s?", fip.FloatingIP)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) doAllocateFIP() (Model, tea.Cmd) {
+	m.statusBar.Hint = "Allocating floating IP..."
+	networkClient := m.client.Network
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtx()
+		defer cancel()
+		shared.Debugf("[action] allocating floating IP")
+		nets, err := network.ListExternalNetworks(ctx, networkClient)
+		if err != nil {
+			shared.Debugf("[action] allocate floating IP failed: %s", err)
+			return shared.ResourceActionErrMsg{Action: "Allocate", Name: "floating IP", Err: err}
+		}
+		if len(nets) == 0 {
+			shared.Debugf("[action] allocate floating IP failed: no external networks available")
+			return shared.ResourceActionErrMsg{Action: "Allocate", Name: "floating IP", Err: fmt.Errorf("no external networks available")}
+		}
+		fip, err := network.AllocateFloatingIP(ctx, networkClient, nets[0].ID)
+		if err != nil {
+			shared.Debugf("[action] allocate floating IP failed: %s", err)
+			return shared.ResourceActionErrMsg{Action: "Allocate", Name: "floating IP", Err: err}
+		}
+		shared.Debugf("[action] allocated floating IP %s", fip.FloatingIP)
+		return shared.ResourceActionMsg{Action: "Allocated", Name: fip.FloatingIP}
+	}
+}
+
+func (m Model) openFIPDisassociateConfirm() (Model, tea.Cmd) {
+	fip := m.floatingIPList.SelectedFIP()
+	if fip == nil || fip.PortID == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("disassociate_fip", fip.ID, fip.FloatingIP)
+	m.confirm.Title = "Disassociate Floating IP"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to disassociate floating IP %s?", fip.FloatingIP)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Security Group actions ---
+
+func (m Model) openSGCreate() (Model, tea.Cmd) {
+	m.sgCreate = sgcreate.New(m.client.Network)
+	m.sgCreate.SetSize(m.width, m.height)
+	return m, m.sgCreate.Init()
+}
+
+func (m Model) openSGDeleteConfirm() (Model, tea.Cmd) {
+	sgID := m.secGroupView.SelectedGroupID()
+	sgName := m.secGroupView.SelectedGroupName()
+	if sgID == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_sg", sgID, sgName)
+	m.confirm.Title = "Delete Security Group"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete security group %q?\nAll rules in this group will also be deleted.", sgName)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openSGRuleDeleteConfirm() (Model, tea.Cmd) {
+	ruleID := m.secGroupView.SelectedRuleID()
+	if ruleID == "" {
+		return m, nil
+	}
+	groupName := m.secGroupView.SelectedGroupName()
+	m.confirm = modal.NewConfirm("delete_sg_rule", ruleID, groupName)
+	m.confirm.Title = "Delete Security Group Rule"
+	m.confirm.Body = fmt.Sprintf("Delete rule from security group %q?", groupName)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openSGRuleCreate() (Model, tea.Cmd) {
+	sgID := m.secGroupView.SelectedGroupID()
+	sgName := m.secGroupView.SelectedGroupName()
+	if sgID == "" {
+		return m, nil
+	}
+	m.sgRuleCreate = sgrulecreate.New(m.client.Network, sgID, sgName)
+	m.sgRuleCreate.SetSize(m.width, m.height)
+	return m, m.sgRuleCreate.Init()
+}
+
+func (m Model) openSGRuleEdit() (Model, tea.Cmd) {
+	r := m.secGroupView.SelectedRule()
+	if r == nil {
+		return m, nil
+	}
+	sgID := m.secGroupView.SelectedGroupID()
+	sgName := m.secGroupView.SelectedGroupName()
+	m.sgRuleCreate = sgrulecreate.NewEdit(m.client.Network, sgID, sgName, *r)
+	m.sgRuleCreate.SetSize(m.width, m.height)
+	return m, m.sgRuleCreate.Init()
+}
+
+func (m Model) openSGRename() (Model, tea.Cmd) {
+	m.sgCreate = sgcreate.NewRename(m.client.Network, m.secGroupView.SelectedGroupID(), m.secGroupView.SelectedGroupName(), m.secGroupView.SGDescription())
+	m.sgCreate.SetSize(m.width, m.height)
+	return m, m.sgCreate.Init()
+}
+
+func (m Model) openSGClone() (Model, tea.Cmd) {
+	m.sgCreate = sgcreate.NewClone(m.client.Network, m.secGroupView.SelectedGroupID(), m.secGroupView.SelectedGroupName(), m.secGroupView.SGDescription())
+	m.sgCreate.SetSize(m.width, m.height)
+	return m, m.sgCreate.Init()
+}
+
+// --- Network actions ---
+
+func (m Model) openNetworkCreate() (Model, tea.Cmd) {
+	m.networkCreate = networkcreate.New(m.client.Network)
+	m.networkCreate.SetSize(m.width, m.height)
+	return m, m.networkCreate.Init()
+}
+
+func (m Model) openNetworkDeleteConfirm() (Model, tea.Cmd) {
+	netID := m.networkView.SelectedNetworkID()
+	netName := m.networkView.SelectedNetworkName()
+	if netID == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_network", netID, netName)
+	m.confirm.Title = "Delete Network"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete network %q?\nAll subnets will also be deleted.", netName)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openSubnetCreate() (Model, tea.Cmd) {
+	netID := m.networkView.SelectedNetworkID()
+	netName := m.networkView.SelectedNetworkName()
+	if netID == "" {
+		return m, nil
+	}
+	m.subnetCreate = subnetcreate.New(m.client.Network, netID, netName)
+	m.subnetCreate.SetSize(m.width, m.height)
+	return m, m.subnetCreate.Init()
+}
+
+func (m Model) openSubnetEdit() (Model, tea.Cmd) {
+	sub := m.networkView.SelectedSubnet()
+	if sub == nil {
+		return m, nil
+	}
+	m.subnetEdit = subnetedit.New(m.client.Network, *sub)
+	m.subnetEdit.SetSize(m.width, m.height)
+	return m, m.subnetEdit.Init()
+}
+
+func (m Model) openSubnetDeleteConfirm() (Model, tea.Cmd) {
+	subID := m.networkView.SelectedSubnetID()
+	subName := m.networkView.SelectedSubnetName()
+	if subID == "" {
+		return m, nil
+	}
+	netName := m.networkView.SelectedNetworkName()
+	m.confirm = modal.NewConfirm("delete_subnet", subID, subName)
+	m.confirm.Title = "Delete Subnet"
+	m.confirm.Body = fmt.Sprintf("Delete subnet %q from network %q?", subName, netName)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Port actions ---
+
+func (m Model) openPortCreate() (Model, tea.Cmd) {
+	netID := m.networkView.SelectedNetworkID()
+	netName := m.networkView.SelectedNetworkName()
+	if netID == "" {
+		return m, nil
+	}
+	subs := m.networkView.NetworkSubnets()
+	m.portCreate = portcreate.New(m.client.Network, netID, netName, subs)
+	m.portCreate.SetSize(m.width, m.height)
+	return m, m.portCreate.Init()
+}
+
+func (m Model) openPortEdit() (Model, tea.Cmd) {
+	p := m.networkView.SelectedPort()
+	if p == nil {
+		return m, nil
+	}
+	m.portEdit = portedit.New(m.client.Network, *p)
+	m.portEdit.SetSize(m.width, m.height)
+	return m, m.portEdit.Init()
+}
+
+func (m Model) openPortDeleteConfirm() (Model, tea.Cmd) {
+	p := m.networkView.SelectedPort()
+	if p == nil {
+		return m, nil
+	}
+	name := p.Name
+	if name == "" {
+		name = p.ID[:8] + "..."
+	}
+	m.confirm = modal.NewConfirm("delete_port", p.ID, name)
+	m.confirm.Title = "Delete Port"
+	if p.DeviceOwner != "" {
+		m.confirm.Body = fmt.Sprintf("Port %q is in use by %s. Delete anyway?", name, p.DeviceOwner)
+	} else {
+		m.confirm.Body = fmt.Sprintf("Delete port %q?", name)
+	}
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Router actions ---
+
+func (m Model) openRouterCreate() (Model, tea.Cmd) {
+	m.routerCreate = routercreate.New(m.client.Network)
+	m.routerCreate.SetSize(m.width, m.height)
+	return m, m.routerCreate.Init()
+}
+
+func (m Model) openRouterDeleteConfirm() (Model, tea.Cmd) {
+	id := m.routerView.SelectedRouterID()
+	name := m.routerView.SelectedRouterName()
+	if id == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_router", id, name)
+	m.confirm.Title = "Delete Router"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete router %q?\nAll interfaces will be removed.", name)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+func (m Model) openAddRouterInterface() (Model, tea.Cmd) {
+	id := m.routerView.SelectedRouterID()
+	name := m.routerView.SelectedRouterName()
+	if id == "" {
+		return m, nil
+	}
+	m.subnetPicker = subnetpicker.New(m.client.Network, id, name)
+	m.subnetPicker.SetSize(m.width, m.height)
+	return m, m.subnetPicker.Init()
+}
+
+func (m Model) openRemoveRouterInterfaceConfirm() (Model, tea.Cmd) {
+	subnetID := m.routerView.SelectedInterfaceSubnetID()
+	if subnetID == "" {
+		return m, nil
+	}
+	routerID := m.routerView.SelectedRouterID()
+	routerName := m.routerView.SelectedRouterName()
+	m.confirm = modal.NewConfirm("remove_router_interface", routerID, routerName)
+	m.confirm.Title = "Remove Interface"
+	m.confirm.Body = fmt.Sprintf("Remove subnet interface from router %q?", routerName)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer actions ---
+
+func (m Model) openLBDeleteConfirm() (Model, tea.Cmd) {
+	lb := m.lbView.SelectedLB()
+	if lb == nil {
+		return m, nil
+	}
+	id, name := lb.ID, lb.Name
+	if name == "" {
+		name = id
+	}
+	m.confirm = modal.NewConfirm("delete_lb", id, name)
+	m.confirm.Title = "Delete Load Balancer"
+	body := fmt.Sprintf("Are you sure you want to delete load balancer %q?", name)
+	lc := len(m.lbView.Listeners())
+	pc := len(m.lbView.Pools())
+	mc := m.lbView.TotalMemberCount()
+	if lc+pc+mc > 0 {
+		body += fmt.Sprintf("\nThis will cascade-delete %d listeners, %d pools, and %d members.", lc, pc, mc)
+	}
+	m.confirm.Body = body
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer create/edit ---
+
+func (m Model) openLBCreate() (Model, tea.Cmd) {
+	m.lbCreate = lbcreate.New(m.client.LoadBalancer, m.client.Network)
+	m.lbCreate.SetSize(m.width, m.height)
+	return m, m.lbCreate.Init()
+}
+
+func (m Model) openLBEdit() (Model, tea.Cmd) {
+	if m.lbView.LBID() == "" {
+		return m, nil
+	}
+	name := m.lbView.LBName()
+	desc := ""
+	if m.lbView.LB() != nil {
+		desc = m.lbView.LB().Description
+	}
+	m.lbCreate = lbcreate.NewEdit(m.client.LoadBalancer, m.lbView.LBID(), name, desc)
+	m.lbCreate.SetSize(m.width, m.height)
+	return m, m.lbCreate.Init()
+}
+
+// --- Load Balancer Listener actions ---
+
+func (m Model) openLBListenerEdit() (Model, tea.Cmd) {
+	l := m.lbView.SelectedListener()
+	if l == nil {
+		return m, nil
+	}
+	m.lbListenerCreate = lblistenercreate.NewEdit(m.client.LoadBalancer, l.ID, l.Name, l.Description, l.ConnLimit, m.lbView.LBName())
+	m.lbListenerCreate.SetSize(m.width, m.height)
+	return m, m.lbListenerCreate.Init()
+}
+
+func (m Model) openLBListenerCreate() (Model, tea.Cmd) {
+	m.lbListenerCreate = lblistenercreate.New(m.client.LoadBalancer, m.lbView.LBID(), m.lbView.LBName())
+	m.lbListenerCreate.SetSize(m.width, m.height)
+	return m, m.lbListenerCreate.Init()
+}
+
+func (m Model) openLBListenerDeleteConfirm() (Model, tea.Cmd) {
+	id := m.lbView.SelectedListenerID()
+	name := m.lbView.SelectedListenerName()
+	if id == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_lb_listener", id, name)
+	m.confirm.Title = "Delete Listener"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete listener %q?", name)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer Pool actions ---
+
+func (m Model) openLBPoolEdit() (Model, tea.Cmd) {
+	p := m.lbView.SelectedPool()
+	if p == nil {
+		return m, nil
+	}
+	m.lbPoolCreate = lbpoolcreate.NewEdit(m.client.LoadBalancer, p.ID, p.Name, p.LBMethod, m.lbView.LBName())
+	m.lbPoolCreate.SetSize(m.width, m.height)
+	return m, m.lbPoolCreate.Init()
+}
+
+func (m Model) openLBPoolCreate() (Model, tea.Cmd) {
+	m.lbPoolCreate = lbpoolcreate.New(m.client.LoadBalancer, m.lbView.LBID(), m.lbView.LBName())
+	m.lbPoolCreate.SetSize(m.width, m.height)
+	return m, m.lbPoolCreate.Init()
+}
+
+func (m Model) openLBPoolDeleteConfirm() (Model, tea.Cmd) {
+	id := m.lbView.SelectedPoolID()
+	name := m.lbView.SelectedPoolName()
+	if id == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_lb_pool", id, name)
+	m.confirm.Title = "Delete Pool"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete pool %q?\nAll members and health monitors will also be removed.", name)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer Member actions ---
+
+func (m Model) openLBMemberEdit() (Model, tea.Cmd) {
+	mem := m.lbView.SelectedMember()
+	poolID := m.lbView.SelectedPoolID()
+	poolName := m.lbView.SelectedPoolName()
+	if mem == nil || poolID == "" {
+		return m, nil
+	}
+	m.lbMemberCreate = lbmembercreate.NewEdit(
+		m.client.LoadBalancer,
+		poolID,
+		mem.ID,
+		mem.Name,
+		mem.Weight,
+		mem.AdminStateUp,
+		mem.Backup,
+		mem.MonitorAddress,
+		mem.MonitorPort,
+		mem.Tags,
+		poolName,
+	)
+	m.lbMemberCreate.SetSize(m.width, m.height)
+	return m, m.lbMemberCreate.Init()
+}
+
+func (m Model) openLBMemberCreate() (Model, tea.Cmd) {
+	poolID := m.lbView.SelectedPoolID()
+	poolName := m.lbView.SelectedPoolName()
+	if poolID == "" {
+		return m, nil
+	}
+	lbVIPAddress := ""
+	if lb := m.lbView.LB(); lb != nil {
+		lbVIPAddress = lb.VipAddress
+	}
+	existingMembers := m.lbView.SelectedPoolMembers()
+	existingMemberAddrs := make([]string, 0, len(existingMembers))
+	for _, member := range existingMembers {
+		existingMemberAddrs = append(existingMemberAddrs, member.Address)
+	}
+	m.lbMemberCreate = lbmembercreate.New(m.client.LoadBalancer, m.client.Compute, poolID, poolName, lbVIPAddress, existingMemberAddrs)
+	m.lbMemberCreate.SetSize(m.width, m.height)
+	return m, m.lbMemberCreate.Init()
+}
+
+func (m Model) openLBMemberDeleteConfirm() (Model, tea.Cmd) {
+	memberID := m.lbView.SelectedMemberID()
+	memberName := m.lbView.SelectedMemberName()
+	poolID := m.lbView.SelectedPoolID()
+	if memberID == "" || poolID == "" {
+		return m, nil
+	}
+	// Encode poolID|memberID in ServerID so it's captured at confirm time
+	c := modal.NewConfirm("delete_lb_member", poolID+"|"+memberID, memberName)
+	c.Title = "Delete Member"
+	c.Body = fmt.Sprintf("Are you sure you want to remove member %q from the pool?", memberName)
+	c.SetSize(m.width, m.height)
+	m.confirm = c
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer Bulk Member Delete ---
+
+func (m Model) openLBBulkMemberDeleteConfirm() (Model, tea.Cmd) {
+	poolID := m.lbView.SelectedPoolID()
+	ids := m.lbView.SelectedMemberIDs()
+	if poolID == "" || len(ids) == 0 {
+		return m, nil
+	}
+	count := len(ids)
+	// Encode poolID in ServerID for executeAction
+	c := modal.NewConfirm("delete_lb_members_bulk", poolID, fmt.Sprintf("%d members", count))
+	c.Title = "Bulk Delete Members"
+	c.Body = fmt.Sprintf("Delete %d selected members from this pool?", count)
+	c.SetSize(m.width, m.height)
+	m.confirm = c
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer Drain action ---
+
+func (m Model) drainLBMember() (Model, tea.Cmd) {
+	mem := m.lbView.SelectedMember()
+	poolID := m.lbView.SelectedPoolID()
+	if mem == nil || poolID == "" {
+		return m, nil
+	}
+	client := m.client.LoadBalancer
+	memberID := mem.ID
+	name := mem.Name
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", mem.Address, mem.ProtocolPort)
+	}
+	zero := 0
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtx()
+		defer cancel()
+		shared.Debugf("[action] draining member %s (weight -> 0)", name)
+		err := loadbalancer.UpdateMember(ctx, client, poolID, memberID, loadbalancer.MemberUpdateOpts{Weight: &zero})
+		if err != nil {
+			return shared.ResourceActionErrMsg{Action: "Drain", Name: name, Err: err}
+		}
+		return shared.ResourceActionMsg{Action: "Draining", Name: name}
+	}
+}
+
+func (m Model) drainLBMembersBulk() (Model, tea.Cmd) {
+	poolID := m.lbView.SelectedPoolID()
+	lbID := ""
+	if lb := m.lbView.LB(); lb != nil {
+		lbID = lb.ID
+	}
+	ids := m.lbView.SelectedMemberIDs()
+	count := len(ids)
+	if poolID == "" || count == 0 {
+		return m, nil
+	}
+	client := m.client.LoadBalancer
+	m.lbView.ClearMemberSelection()
+	zero := 0
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtxLong()
+		defer cancel()
+		var failed int
+		for i, memberID := range ids {
+			if i > 0 && lbID != "" {
+				if err := loadbalancer.WaitForActive(ctx, client, lbID, 60*time.Second); err != nil {
+					shared.Debugf("[action] bulk drain wait failed: %s", err)
+					failed += len(ids) - i
+					break
+				}
+			}
+			shared.Debugf("[action] bulk draining member %s (%d/%d)", memberID, i+1, count)
+			if err := loadbalancer.UpdateMember(ctx, client, poolID, memberID, loadbalancer.MemberUpdateOpts{Weight: &zero}); err != nil {
+				shared.Debugf("[action] bulk drain member %s failed: %s", memberID, err)
+				failed++
+			}
+		}
+		if failed > 0 {
+			return shared.ResourceActionErrMsg{
+				Action: "Bulk drain",
+				Name:   fmt.Sprintf("%d of %d members", failed, count),
+				Err:    fmt.Errorf("%d members failed to drain", failed),
+			}
+		}
+		return shared.ResourceActionMsg{Action: fmt.Sprintf("Draining %d members in", count), Name: "pool"}
+	}
+}
+
+// --- Load Balancer Monitor actions ---
+
+func (m Model) openLBMonitorCreate() (Model, tea.Cmd) {
+	pool := m.lbView.SelectedPool()
+	if pool == nil {
+		return m, nil
+	}
+	m.lbMonitorCreate = lbmonitorcreate.New(m.client.LoadBalancer, pool.ID, pool.Name)
+	m.lbMonitorCreate.SetSize(m.width, m.height)
+	return m, m.lbMonitorCreate.Init()
+}
+
+func (m Model) openLBMonitorEdit() (Model, tea.Cmd) {
+	pool := m.lbView.SelectedPool()
+	if pool == nil || pool.MonitorID == "" {
+		return m, nil
+	}
+	mon := m.lbView.SelectedPoolMonitor()
+	if mon == nil {
+		return m, nil
+	}
+	m.lbMonitorCreate = lbmonitorcreate.NewEdit(m.client.LoadBalancer, mon.ID, mon, pool.Name)
+	m.lbMonitorCreate.SetSize(m.width, m.height)
+	return m, m.lbMonitorCreate.Init()
+}
+
+func (m Model) openLBMonitorDeleteConfirm() (Model, tea.Cmd) {
+	pool := m.lbView.SelectedPool()
+	if pool == nil || pool.MonitorID == "" {
+		return m, nil
+	}
+	c := modal.NewConfirm("delete_lb_monitor", pool.MonitorID, pool.Name)
+	c.Title = "Remove Health Monitor"
+	c.Body = fmt.Sprintf("Remove health monitor from pool %q?", pool.Name)
+	c.SetSize(m.width, m.height)
+	m.confirm = c
+	m.activeModal = modalConfirm
+	return m, nil
+}
+
+// --- Load Balancer Admin State toggle ---
+
+func (m Model) toggleLBAdminState() (Model, tea.Cmd) {
+	lb := m.lbView.LB()
+	if lb == nil {
+		return m, nil
+	}
+	newState := !lb.AdminStateUp
+	client := m.client.LoadBalancer
+	id := lb.ID
+	name := lb.Name
+	action := "Enabled"
+	if !newState {
+		action = "Disabled"
+	}
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtx()
+		defer cancel()
+		shared.Debugf("[action] toggling LB admin state %s -> %v", name, newState)
+		err := loadbalancer.UpdateLoadBalancer(ctx, client, id, nil, nil, &newState)
+		if err != nil {
+			return shared.ResourceActionErrMsg{Action: action, Name: name, Err: err}
+		}
+		return shared.ResourceActionMsg{Action: action + " LB", Name: name}
+	}
+}
+
+func (m Model) toggleListenerAdminState() (Model, tea.Cmd) {
+	l := m.lbView.SelectedListener()
+	if l == nil {
+		return m, nil
+	}
+	newState := !l.AdminStateUp
+	client := m.client.LoadBalancer
+	id := l.ID
+	name := l.Name
+	action := "Enabled"
+	if !newState {
+		action = "Disabled"
+	}
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtx()
+		defer cancel()
+		shared.Debugf("[action] toggling listener admin state %s -> %v", name, newState)
+		err := loadbalancer.UpdateListener(ctx, client, id, nil, nil, nil, &newState)
+		if err != nil {
+			return shared.ResourceActionErrMsg{Action: action, Name: name, Err: err}
+		}
+		return shared.ResourceActionMsg{Action: action + " listener", Name: name}
+	}
+}
+
+func (m Model) togglePoolAdminState() (Model, tea.Cmd) {
+	p := m.lbView.SelectedPool()
+	if p == nil {
+		return m, nil
+	}
+	newState := !p.AdminStateUp
+	client := m.client.LoadBalancer
+	id := p.ID
+	name := p.Name
+	action := "Enabled"
+	if !newState {
+		action = "Disabled"
+	}
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtx()
+		defer cancel()
+		shared.Debugf("[action] toggling pool admin state %s -> %v", name, newState)
+		err := loadbalancer.UpdatePool(ctx, client, id, nil, "", &newState)
+		if err != nil {
+			return shared.ResourceActionErrMsg{Action: action, Name: name, Err: err}
+		}
+		return shared.ResourceActionMsg{Action: action + " pool", Name: name}
+	}
+}
+
+func (m Model) toggleMemberAdminState() (Model, tea.Cmd) {
+	mem := m.lbView.SelectedMember()
+	poolID := m.lbView.SelectedPoolID()
+	if mem == nil || poolID == "" {
+		return m, nil
+	}
+	newState := !mem.AdminStateUp
+	client := m.client.LoadBalancer
+	memberID := mem.ID
+	name := mem.Name
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", mem.Address, mem.ProtocolPort)
+	}
+	action := "Enabled"
+	if !newState {
+		action = "Disabled"
+	}
+	return m, func() tea.Msg {
+		ctx, cancel := actionCtx()
+		defer cancel()
+		shared.Debugf("[action] toggling member admin state %s -> %v", name, newState)
+		err := loadbalancer.UpdateMember(ctx, client, poolID, memberID, loadbalancer.MemberUpdateOpts{AdminStateUp: &newState})
+		if err != nil {
+			return shared.ResourceActionErrMsg{Action: action, Name: name, Err: err}
+		}
+		return shared.ResourceActionMsg{Action: action + " member", Name: name}
+	}
+}
+
+// --- Key Pair actions ---
+
+func (m Model) openKeypairDetail() (Model, tea.Cmd) {
+	kp := m.keypairList.SelectedKeyPair()
+	if kp == nil {
+		return m, nil
+	}
+	m.keypairDetail = keypairdetail.New(m.client.Compute, kp.Name)
+	m.keypairDetail.SetSize(m.width, m.height)
+	m.view = viewKeypairDetail
+	m.statusBar.CurrentView = "keypairdetail"
+	m.statusBar.Hint = m.keypairDetail.Hints()
+	return m, m.keypairDetail.Init()
+}
+
+func (m Model) openKeypairCreate() (Model, tea.Cmd) {
+	m.keypairCreate = keypaircreate.New(m.client.Compute)
+	m.keypairCreate.SetSize(m.width, m.height)
+	m.view = viewKeypairCreate
+	m.statusBar.CurrentView = "keypaircreate"
+	m.statusBar.Hint = m.keypairCreate.Hints()
+	return m, m.keypairCreate.Init()
+}
+
+func (m Model) openKeyPairDeleteConfirm() (Model, tea.Cmd) {
+	var name string
+	switch m.view {
+	case viewKeypairList:
+		if kp := m.keypairList.SelectedKeyPair(); kp != nil {
+			name = kp.Name
+		}
+	case viewKeypairDetail:
+		name = m.keypairDetail.KeyPairName()
+	}
+	if name == "" {
+		return m, nil
+	}
+	m.confirm = modal.NewConfirm("delete_keypair", name, name)
+	m.confirm.Title = "Delete Key Pair"
+	m.confirm.Body = fmt.Sprintf("Are you sure you want to delete key pair %q?", name)
+	m.confirm.SetSize(m.width, m.height)
+	m.activeModal = modalConfirm
+	return m, nil
+}
